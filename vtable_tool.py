@@ -3,6 +3,8 @@ import re
 import idc
 import collections
 
+NULL_POSSIBLE_IN_VTABLE = False
+DEMUNGLE_NAME = False
 BAD_C_NAME_PATTERN = re.compile('[^a-zA-Z_0-9:]')
 EA64 = idaapi.get_inf_structure().is_64bit()
 EA_SIZE = 8 if EA64 else 4
@@ -194,7 +196,40 @@ def to_hex(ea):
     """ Formats address so it could be double clicked at console """
     if EA64:
         return "0x{:016X}".format(ea)
-    return "0x{:08X}".format(ea)
+    return "0x{:08X}".format(ea) 
+
+def search_duplicate_fields(virt_funcs):
+    # Returns list of lists with duplicate fields
+
+    default_dict = collections.defaultdict(list)
+    for idx, func in enumerate(virt_funcs):
+        default_dict[func.name].append(idx)
+    return [indices for indices in list(default_dict.values()) if len(indices) > 1]
+
+def is_imported_ea(ea):
+    if idc.get_segm_name(ea) == ".plt":
+        return True
+    return False
+
+
+def is_code_ea(ea):
+    if idaapi.cvar.inf.procname == "ARM":
+        # In case of ARM code in THUMB mode we sometimes get pointers with thumb bit set
+        flags = idaapi.get_full_flags(ea & -2)  # flags_t
+    else:
+        flags = idaapi.get_full_flags(ea)
+    return idaapi.is_code(flags)
+
+
+def get_ptr(ea):
+    """ Reads ptr at specified address. """
+    if EA64:
+        return idaapi.get_64bit(ea)
+    ptr = idaapi.get_32bit(ea)
+    if idaapi.cvar.inf.procname == "ARM":
+        ptr &= -2    # Clear thumb bit
+    return ptr
+    
     
 class AbstractMember:
     def __init__(self, offset, scanned_variable, origin):
@@ -282,6 +317,9 @@ class VirtualFunction:
         self.offset = offset
         self.class_name = class_name
         self.visited = False
+        self.name = None
+        self.get_name()
+        print("Created virtual function {}".format(self.name))
 
     def get_ptr_tinfo(self):
         # print self.tinfo.dstr()
@@ -301,25 +339,45 @@ class VirtualFunction:
     def get_information(self):
         return [to_hex(self.address), self.name, self.tinfo.dstr()]
 
-    @property
-    def name(self):
+    def get_name(self):
+        if self.name:
+            return self.name
         name = idaapi.get_name(self.address)
         #if idaapi.is_valid_typename(name):
         #    return name
         
         if name is None:
             name = "gap_0x{}".format(self.offset)
+            
+        if "__" in name:
+            name = name[name.index("__")+2:]
+            
+        if self.class_name:
+            name = self.class_name + "__" + name
         
-        prefix=name[:name.index('_Z')] if name[:2]=='j_' and ('_Z' in name) else ""
-        name = END_NUMBER_PATTERN.sub("", name)
+        if DEMUNGLE_NAME:
+            prefix=name[:name.index('_Z')] if name[:2]=='j_' and ('_Z' in name) else ""
+            name = END_NUMBER_PATTERN.sub("", name)
+            
+            dname = idc.demangle_name(name, idc.get_inf_attr(idc.INF_SHORT_DN))
+            if dname:         
+                name = demangled_name_to_c_str(dname)
+            print("Name: {} Dname: {}".format(name, dname))
         
         
+            self.name = prefix + name
+        else:
+            self.name = name
+        return self.name
         
-        dname = idc.demangle_name(name, idc.get_inf_attr(idc.INF_SHORT_DN))
-        if dname:         
-            name = demangled_name_to_c_str(dname)
-        print("Name: {} Dname: {}".format(name, dname))
-        return prefix + name
+    def set_name(self, name):
+        self.name = name
+        
+    def ida_set_name(self):
+        idaapi.set_name(self.address, self.name, idaapi.SN_CHECK)
+            #idaapi.force_name(function.address, function.name)
+        print("Set func name at {} to {}".format(hex(self.offset), self.name))
+    
 
     @property
     def tinfo(self):
@@ -352,38 +410,6 @@ class ImportedVirtualFunction(VirtualFunction):
     def show_location(self):
         idaapi.jumpto(self.address)
 
-def search_duplicate_fields(virt_funcs):
-    # Returns list of lists with duplicate fields
-
-    default_dict = collections.defaultdict(list)
-    for idx, func in enumerate(virt_funcs):
-        default_dict[func.name].append(idx)
-    return [indices for indices in list(default_dict.values()) if len(indices) > 1]
-
-def is_imported_ea(ea):
-    if idc.get_segm_name(ea) == ".plt":
-        return True
-    return False
-
-
-def is_code_ea(ea):
-    if idaapi.cvar.inf.procname == "ARM":
-        # In case of ARM code in THUMB mode we sometimes get pointers with thumb bit set
-        flags = idaapi.get_full_flags(ea & -2)  # flags_t
-    else:
-        flags = idaapi.get_full_flags(ea)
-    return idaapi.is_code(flags)
-
-
-def get_ptr(ea):
-    """ Reads ptr at specified address. """
-    if EA64:
-        return idaapi.get_64bit(ea)
-    ptr = idaapi.get_32bit(ea)
-    if idaapi.cvar.inf.procname == "ARM":
-        ptr &= -2    # Clear thumb bit
-    return ptr
-
 PVOID_TINFO = idaapi.tinfo_t()
 VOID_TINFO = idaapi.tinfo_t(idaapi.BT_VOID)
 PVOID_TINFO.create_ptr(VOID_TINFO)
@@ -402,9 +428,10 @@ class VirtualTable(AbstractMember):
         self.name = "__vftable" + ("_{0:X}".format(self.offset) if self.offset else "")
         self.vtable_name, self.have_nice_name = parse_vtable_name(address)
         if "vtab" in self.vtable_name:
-            self.class_name = self.vtable_name[:self.vtable_name.index("_")]
+            self.class_name = self.vtable_name[:self.vtable_name.index("_vtab")]
         else:
             self.class_name = ""
+        print("Vtable name: {} class name: {} address: 0x{:X}".format(self.name, self.class_name, self.address))
         self.populate()
 
     def populate(self):
@@ -415,10 +442,11 @@ class VirtualTable(AbstractMember):
                 self.virtual_functions.append(VirtualFunction(ptr, address - self.address, class_name=self.class_name))
             elif is_imported_ea(ptr):
                 self.virtual_functions.append(ImportedVirtualFunction(ptr, address - self.address))
-            elif 0 and ptr == 0 and get_ptr(address + EA_SIZE) == 0:
-                print("end at 0x{0:08X} 0x{0:08X} 0x{0:08X}".format(address, ptr, get_ptr(address + EA_SIZE)))
+            elif NULL_POSSIBLE_IN_VTABLE and ptr == 0 and get_ptr(address + EA_SIZE) == 0:
+                # 2 zeros
                 break
-            elif 1 and ptr == 0:
+            elif not NULL_POSSIBLE_IN_VTABLE and ptr == 0:
+                # 1 zeros
                 break
                 #print("add empty at 0x{0:02X}".format(address - self.address))
                 #self.virtual_functions.append(VirtualFunction(0, address - self.address))
@@ -430,6 +458,7 @@ class VirtualTable(AbstractMember):
             # for first xref
             if 0 and idaapi.get_first_dref_to(address) != idaapi.BADADDR:
                 break
+        print("Vtable end at 0x{0:08X} ".format(address))       
 
     def create_tinfo(self):
         # print "(Virtual table) at address: 0x{0:08X} name: {1}".format(self.address, self.name)
@@ -438,18 +467,18 @@ class VirtualTable(AbstractMember):
             first_entry_idx = duplicates.pop(0)
             print("[Warning] Found duplicate virtual functions", self.virtual_functions[first_entry_idx].name)
             for num, dup in enumerate(duplicates):
-                self.virtual_functions[dup].name = "{0}_{1}".format(self.virtual_functions[first_entry_idx].name, num + 1)
+                self.virtual_functions[dup].set_name("{0}_{1}".format(self.virtual_functions[first_entry_idx].name, num + 1))
                 print("set duplicate name {}".format(self.virtual_functions[dup].name))
         
         
+        self.set_ida_names()
+        
         udt_data = idaapi.udt_type_data_t()
         for idx, function in enumerate(self.virtual_functions):
-            if not function.name.startswith("sub"):
-                idaapi.set_name(function.address, function.name, idaapi.SN_CHECK)
-            else:
-                idaapi.set_name(function.address, "{}::{}".format(function.class_name, function.name), idaapi.SN_CHECK)
-            #idaapi.force_name(function.address, function.name)
-            print("Set func name at {} to {}".format(hex(idx), function.name))
+            #if not function.name.startswith("sub"):
+            #    idaapi.set_name(function.address, function.name, idaapi.SN_CHECK)
+            #else:
+            
             udt_data.push_back(function.get_udt_member())
 
         final_tinfo = idaapi.tinfo_t()
@@ -458,6 +487,10 @@ class VirtualTable(AbstractMember):
             #                                                      | idaapi.PRTYPE_SEMI, final_tinfo, self.name, None)
             return final_tinfo
         print("[ERROR] Virtual table creation failed")
+        
+    def set_ida_names(self):    
+        for idx, function in enumerate(self.virtual_functions):
+            function.ida_set_name()
 
     def import_to_structures(self, ask=False):
         """
@@ -511,6 +544,7 @@ class VirtualTable(AbstractMember):
     def switch_array_flag(self):
         pass
 
+    
     @staticmethod
     def check_address(address):
         # Checks if given address contains virtual table. Returns True if more than 2 function pointers found
@@ -610,4 +644,25 @@ class CreateVtable(Action):
         return idaapi.AST_ENABLE
 
 
+class RenameFuncs(Action):
+    description = "Rename functions"
+    hotkey = "W"
+
+    def __init__(self):
+        super(RenameFuncs, self).__init__()
+
+    @staticmethod
+    def check(ea):
+        return ea != idaapi.BADADDR #and VirtualTable.check_address(ea)
+
+    def activate(self, ctx):
+        ea = ctx.cur_ea
+        if self.check(ea):
+            vtable = VirtualTable(0, ea)
+            vtable.set_ida_names()
+
+    def update(self, ctx):
+        return idaapi.AST_ENABLE
+
 action_manager.register(CreateVtable())
+action_manager.register(RenameFuncs())
