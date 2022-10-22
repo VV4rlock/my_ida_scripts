@@ -353,7 +353,7 @@ class VirtualFunction:
             name = name[name.index("__")+2:]
             
         if self.class_name:
-            name = self.class_name + "__" + name
+            name = self.class_name + "_0x{:X}".format(self.offset) + "__" + name
         
         if DEMUNGLE_NAME:
             prefix=name[:name.index('_Z')] if name[:2]=='j_' and ('_Z' in name) else ""
