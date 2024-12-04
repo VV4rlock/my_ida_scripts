@@ -1,4 +1,5 @@
 import idaapi
+import ida_ida
 import re
 import idc
 import collections
@@ -6,19 +7,23 @@ import collections
 NULL_POSSIBLE_IN_VTABLE = False
 DEMUNGLE_NAME = False
 BAD_C_NAME_PATTERN = re.compile('[^a-zA-Z_0-9:]')
-EA64 = idaapi.get_inf_structure().is_64bit()
-EA_SIZE = 8 if EA64 else 4
+try:
+    EA64 = idaapi.get_inf_structure().is_64bit()
+except:
+    EA64 = None
+
+if EA64 is not None:
+    EA_SIZE = 8 if EA64 else 4
+else:
+    EA_SIZE = 4 if ida_ida.inf_is_32bit_exactly() else 8
 
 def demangled_name_to_c_str(name):
     """
     Removes or replaces characters from demangled symbol so that it was possible to create legal C structure from it
     """
         
-    print(type(name))
     if not BAD_C_NAME_PATTERN.findall(name):
         return name
-    
-
 
     # FIXME: This is very ugly way to find and replace illegal characters
     idx = name.find("::operator")
@@ -211,9 +216,15 @@ def is_imported_ea(ea):
         return True
     return False
 
+def get_procname():
+    try:
+        return idaapi.cvar.inf.procname
+    except:
+        pass
+    return ida_ida.inf_get_procname()
 
 def is_code_ea(ea):
-    if idaapi.cvar.inf.procname == "ARM":
+    if get_procname() == "ARM":
         # In case of ARM code in THUMB mode we sometimes get pointers with thumb bit set
         flags = idaapi.get_full_flags(ea & -2)  # flags_t
     else:
@@ -226,7 +237,7 @@ def get_ptr(ea):
     if EA64:
         return idaapi.get_64bit(ea)
     ptr = idaapi.get_32bit(ea)
-    if idaapi.cvar.inf.procname == "ARM":
+    if get_procname() == "ARM":
         ptr &= -2    # Clear thumb bit
     return ptr
     
@@ -346,6 +357,9 @@ class VirtualFunction:
         #if idaapi.is_valid_typename(name):
         #    return name
         
+        if any([i in name for i in ["RefCounter"]]):
+            name = None        
+        
         if name is None:
             name = "gap_0x{}".format(self.offset)
             
@@ -368,15 +382,16 @@ class VirtualFunction:
             self.name = prefix + name
         else:
             self.name = name
+        self.name = self.name.replace(":", "_")
         return self.name
         
     def set_name(self, name):
         self.name = name
         
     def ida_set_name(self):
-        idaapi.set_name(self.address, self.name, idaapi.SN_CHECK)
-            #idaapi.force_name(function.address, function.name)
-        print("Set func name at {} to {}".format(hex(self.offset), self.name))
+        if idaapi.get_name(self.address).startswith("sub"):
+            idaapi.set_name(self.address, self.name, idaapi.SN_CHECK)
+            print("Set func name at {} to {}".format(hex(self.offset), self.name))
     
 
     @property
@@ -436,21 +451,18 @@ class VirtualTable(AbstractMember):
 
     def populate(self):
         address = self.address
+        first = True
         while True:
+            #check if next vtab after current
+            
+                
             ptr = get_ptr(address)
             if is_code_ea(ptr):
                 self.virtual_functions.append(VirtualFunction(ptr, address - self.address, class_name=self.class_name))
             elif is_imported_ea(ptr):
                 self.virtual_functions.append(ImportedVirtualFunction(ptr, address - self.address))
-            elif NULL_POSSIBLE_IN_VTABLE and ptr == 0 and get_ptr(address + EA_SIZE) == 0:
-                # 2 zeros
+            elif ptr == 0:
                 break
-            elif not NULL_POSSIBLE_IN_VTABLE and ptr == 0:
-                # 1 zeros
-                break
-                #print("add empty at 0x{0:02X}".format(address - self.address))
-                #self.virtual_functions.append(VirtualFunction(0, address - self.address))
-                # empty field ))
                 
             print("populate: 0x{0:08X}".format(ptr))
             address += EA_SIZE
@@ -515,7 +527,11 @@ class VirtualTable(AbstractMember):
 
         if ordinal:
             print("[Info] Virtual table " + name + " added to Local Types; ordinal="+str(ordinal))
-            return idaapi.import_type(idaapi.cvar.idati, -1, name)
+            try:
+                return idaapi.import_type(idaapi.cvar.idati, -1, name)
+            except:
+                pass
+            return idc.import_type(idaapi.cvar.idati, name)
         else:
             print("[Error] Failed to create virtual table " + name)
             print("*" * 100)

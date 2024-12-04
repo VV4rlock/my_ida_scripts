@@ -2,10 +2,31 @@ import idaapi
 import idautils
 from collections import defaultdict
 
-EA64 = idaapi.get_inf_structure().is_64bit()
+try:
+    EA64 = idaapi.get_inf_structure().is_64bit()
+except:
+    EA64 = not ida_ida.inf_is_32bit_exactly()
+    
 EA_SIZE = 8 if EA64 else 4
 
-#hx_callback_manager.finalize()
+def convert_funcname_to_valid(name):
+    dname = idaapi.demangle_name(name, idc.get_inf_attr(idc.INF_LONG_DN))
+    if dname is None:
+        return name
+    name = dname
+    args_idx_start = name.index('(') + 1
+    args_idx_end = name.index(')')
+    fname = name[:args_idx_start - 1]
+    args = name[args_idx_start: args_idx_end].split(',')
+    for i in range(len(args)):
+        arg = args[i]
+        arg = arg.strip(' ')
+        arg = arg.replace(' ', '_')
+        arg = arg.replace(' *', '_ptr')
+        arg = arg.replace('*', '_ptr')
+        args[i] = arg
+    return "{}_I_{}_I".format(fname, "_I_".join(args))
+
 class HexRaysCallbackManager(object):
     def __init__(self):
         self.__hexrays_event_handlers = defaultdict(list)
@@ -27,8 +48,11 @@ class HexRaysCallbackManager(object):
         # IDA expects zero
         return 0
 
-
+try:
+    hx_callback_manager.finalize()
+except: pass
 hx_callback_manager = HexRaysCallbackManager()
+
 
 
 class HexRaysEventHandler(object):
@@ -48,7 +72,6 @@ class MemberDoubleClick(HexRaysEventHandler):
         item = hx_view.item # ctree_item_t #cursor item .e - expression, x - first operand
         if item.citype == idaapi.VDI_EXPR and item.e.op in (idaapi.cot_memptr, idaapi.cot_memref):
             if item.e.x.op == idaapi.cot_memptr:
-                print("2")
                 vtable_tinfo = item.e.x.type
                 if vtable_tinfo.is_ptr():
                     vtable_tinfo = vtable_tinfo.get_pointed_object()
@@ -56,11 +79,10 @@ class MemberDoubleClick(HexRaysEventHandler):
                 class_tinfo = item.e.x.x.type.get_pointed_object()
                 vtable_offset = item.e.x.m
 
-                #func_name = get_member_name(vtable_tinfo, method_offset)
                 name = str(vtable_tinfo)
-                #print(type(vtable_tinfo))
                 sid = idc.get_name_ea_simple(name)
-                #print(sid)
+                struc_id = idaapi.get_struc_id(name)
+                struc_func_name = idc.get_member_name(struc_id, method_offset)
                 
                 if sid == idaapi.BADADDR:
                     print("[ERROR] struct {} not found".format(name))
@@ -76,6 +98,11 @@ class MemberDoubleClick(HexRaysEventHandler):
                 #print(xrefs[0], hex(xrefs[0].frm), method_offset, xrefs[0].frm + method_offset, hex(func_ea))
                 if func_ea:
                     idaapi.open_pseudocode(func_ea, 0)
+                    real_func_name = idaapi.get_name(func_ea)
+                    demangled_name = convert_funcname_to_valid(real_func_name)
+                    if demangled_name and demangled_name != struc_func_name:
+                        print("changing name in structure from '{}' to '{}'".format(struc_func_name, demangled_name))
+                        idc.set_member_name(struc_id, method_offset, demangled_name)
                     return 0
 
             return 1
